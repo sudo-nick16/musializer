@@ -5,6 +5,8 @@
 #include <math.h>
 #include <string.h>
 #include <complex.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "config.h"
 #include "plug.h"
@@ -832,6 +834,143 @@ static bool volume_slider_with_location(const char *file, int line, Rectangle pr
     return dragging || updated;
 }
 
+typedef struct {
+    char* file_name;
+    char* dir_path;
+} file_info;
+
+file_info *get_file_info(const char* file_path)
+{
+    int file_path_len = strlen(file_path);
+    int file_name_len = 0;
+    int dir_path_len = 0;
+
+    for(int i = file_path_len - 1; i >= 0; --i) {
+        if (file_path[i] == '/') {
+            file_name_len = file_path_len - i - 1;
+            dir_path_len = i + 1;
+            break;
+        }
+    }
+    if (!file_name_len || !dir_path_len) {
+        return NULL;
+    }
+
+    char *file_name = malloc(file_name_len + 1);
+    memset(file_name, '\0', file_name_len + 1);
+    for (int i = 0; i < file_name_len; ++i) {
+        file_name[i] = file_path[file_path_len - file_name_len + i];
+    }
+
+    char *dir_path = malloc(dir_path_len + 1);
+    memset(dir_path, '\0', dir_path_len + 1);
+    strncpy(dir_path, file_path, dir_path_len);
+
+    file_info *f = malloc(sizeof(file_info));
+    f->dir_path = dir_path;
+    f->file_name = file_name;
+    return f;
+}
+
+char *ensure_music_dir(const char* dir_path) {
+    int music_dir_path_len = strlen(dir_path) + strlen(".mugen");
+    char *music_dir_path = malloc(music_dir_path_len + 1);
+    memset(music_dir_path, '\0', music_dir_path_len + 1);
+    strncpy(music_dir_path, dir_path, music_dir_path_len);
+    strcat(music_dir_path, ".mugen");
+
+    int ret = mkdir(music_dir_path, 0777);
+    if (ret < 0) {
+        TraceLog(LOG_INFO, "Music directory already exists.\n");
+    } else if (ret == 0){
+        TraceLog(LOG_INFO, "Music directory created.\n");
+    }
+
+    return music_dir_path;
+}
+
+static Music *load_music_via_ffmpeg(const char* file_path) 
+{
+    file_info *f = get_file_info(file_path);
+    if (f == NULL) {
+        TraceLog(LOG_ERROR, "Could not get file info.");
+        return NULL;
+    }
+
+    char *music_dir_path = ensure_music_dir(f->dir_path);
+
+    int music_file_path_len = strlen(music_dir_path) + 1 + strlen(f->file_name) + strlen(".mp3");
+    char *music_file_path = malloc(music_file_path_len + 1);
+    memset(music_file_path, '\0', music_file_path_len + 1);
+    strcat(music_file_path, music_dir_path);
+    strcat(music_file_path, "/");
+    strcat(music_file_path, f->file_name);
+    strcat(music_file_path, ".mp3");
+
+    free(f);
+
+    if (access(music_file_path, F_OK) == 0) {
+        Music m = LoadMusicStream(music_file_path);
+        Music *music= malloc(sizeof(Music));
+        music->ctxType = m.ctxType;
+        music->ctxData = m.ctxData;
+        music->stream = m.stream;
+        music->frameCount = m.frameCount;
+        music->looping = m.looping;
+        return music;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        TraceLog(LOG_ERROR, "FILE IO: Could not create ffmpeg child process.");
+        return NULL;
+    }
+    if (pid == 0) {
+        int ret = execlp("ffmpeg",
+                "ffmpeg", "-hide_banner", "-loglevel", "quiet",
+                "-i", file_path,
+                "-f", "mp3",
+                music_file_path,
+                NULL
+        );
+        if (ret < 0) {
+            TraceLog(LOG_ERROR, "FILE IO: Could not execute ffmpeg command - %s", strerror(errno));
+            return NULL;
+        }
+        assert(0 && "unreachable");
+        exit(0);
+    }
+
+    for (;;) {
+        int wstatus = 0;
+        if (waitpid(pid, &wstatus, 0) < 0) {
+            TraceLog(LOG_ERROR, "FFMPEG: could not wait for ffmpeg child process to finish: %s", strerror(errno));
+            return NULL;
+        }
+        if (WIFEXITED(wstatus)) {
+            int exit_status = WEXITSTATUS(wstatus);
+            if (exit_status != 0) {
+                TraceLog(LOG_ERROR, "FFMPEG: ffmpeg exited with code %d", exit_status);
+                return NULL;
+            }
+            break;
+        }
+        if (WIFSIGNALED(wstatus)) {
+            TraceLog(LOG_ERROR, "FFMPEG: ffmpeg got terminated by %s", strsignal(WTERMSIG(wstatus)));
+            return NULL;
+        }
+    }
+
+    Music m = LoadMusicStream(music_file_path);
+    Music *music= malloc(sizeof(Music));
+    music->ctxType = m.ctxType;
+    music->ctxData = m.ctxData;
+    music->stream = m.stream;
+    music->frameCount = m.frameCount;
+    music->looping = m.looping;
+    return music;
+}
+
 static void preview_screen(void)
 {
     int w = GetRenderWidth();
@@ -846,6 +985,16 @@ static void preview_screen(void)
             if (track) StopMusicStream(track->music);
 
             Music music = LoadMusicStream(file_path);
+
+            if (!IsMusicReady(music)) {
+                Music *ffmpeg_music = load_music_via_ffmpeg(file_path);
+                if (ffmpeg_music == NULL) {
+                    free(file_path);
+                    error_load_file_popup();
+                    continue;
+                }
+                music = *ffmpeg_music;
+            }
 
             if (IsMusicReady(music)) {
                 AttachAudioStreamProcessor(music.stream, callback);
