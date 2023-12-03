@@ -5,8 +5,6 @@
 #include <math.h>
 #include <string.h>
 #include <complex.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include "config.h"
 #include "plug.h"
